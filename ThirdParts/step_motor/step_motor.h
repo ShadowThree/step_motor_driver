@@ -22,6 +22,7 @@ typedef struct {
   int32_t tar_pos;
   uint16_t def_step_num; // default step for acceleration and deceleration
   uint16_t accele_step;
+	uint16_t uniform_step;
   uint16_t decele_step;
   uint16_t cur_step; // current step for acceleration and deceleration
 } MOTOR_TYPE_t;
@@ -29,7 +30,7 @@ typedef struct {
 extern MOTOR_TYPE_t motor;
 
 int32_t step_motor_get_pos(void);
-void step_motor_set_pos(int32_t pos);
+uint8_t step_motor_set_pos(int32_t pos);
 uint16_t get_next_speed(void);
 
 #endif // __STEP_MOTOR_H__
