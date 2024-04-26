@@ -3,7 +3,10 @@
 #include "tim.h"
 #include <stdint.h>
 
-#if LOG_ENABLE
+#define MOTOR_LOG_ENABLE 1
+#define CURVE_ACCELE_DECELE 1
+
+#if MOTOR_LOG_ENABLE
 #include <dbger.h>
 #define M_DBG(fmt, ...) LOG_DBG(fmt, ##__VA_ARGS__)
 #define M_ERR(fmt, ...) LOG_ERR(fmt, ##__VA_ARGS__)
@@ -20,149 +23,252 @@
 #endif // CURVE_ACCELE_DECELE
 
 // default step number for acceleration and deceleration
-#define DEFAULT_STEP_NUM 100
+#define DEFAULT_STEP_NUM 200
 
-#define TIM_PWM_START() HAL_TIM_PWM_Start_IT(&htim13, TIM_CHANNEL_1)
-#define TIM_PWM_STOP() 	HAL_TIM_PWM_Stop_IT(&htim13, TIM_CHANNEL_1)
+// abstracted speed range(NOT important)
+#define MIN_SPEED (0)
+#define MAX_SPEED (10000)
 
-#define MOTOR_SET_ENABLE(en)	HAL_GPIO_WritePin(MOTOR_EN_GPIO_Port, MOTOR_EN_Pin, (GPIO_PinState)(en))
-#define MOTOR_SET_DIR(dir)		HAL_GPIO_WritePin(MOTOR_DIR_GPIO_Port, MOTOR_DIR_Pin, (GPIO_PinState)(dir))
+#define TIM_PWM_START() HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1)
+#define TIM_PWM_STOP() HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1)
 
-#define MOTOR_SET_SPEED(spd)	__HAL_TIM_SET_AUTORELOAD(&htim13, spd)
+#define MOTOR_POWER_ON()  // HAL_GPIO_WritePin(POWER_DRV_GPIO_Port, POWER_DRV_Pin, GPIO_PIN_SET)
+#define MOTOR_POWER_OFF() // HAL_GPIO_WritePin(POWER_DRV_GPIO_Port, POWER_DRV_Pin, GPIO_PIN_RESET)
 
-MOTOR_TYPE_t motor = {.dir = MOTOR_DIR_IN,
-                      .sta = MOTOR_STA_STOP,
-                      .cur_pos = 0,
-                      .tar_pos = 0,
-                      .def_step_num = DEFAULT_STEP_NUM,
-                      .accele_step = 0,
-											.uniform_step = 0,
-                      .decele_step = 0,
-                      .cur_step = 0};
+#define MOTOR_SET_ENABLE(en) // HAL_GPIO_WritePin(MOTOR_EN_GPIO_Port, MOTOR_EN_Pin, (GPIO_PinState)(!en))
+#define MOTOR_SET_DIR(dir)	 // HAL_GPIO_WritePin(MOTOR_DIR_GPIO_Port, MOTOR_DIR_Pin, (GPIO_PinState)(dir))
 
-void step_motor_init(void) {}
+#if CURVE_ACCELE_DECELE
+// calculate abstracted speed
+#define MOTOR_CAL_SPEED(step) ((1 - COS(_PI * (step) / motor.def_step_num)) / 2 * (MAX_SPEED - MIN_SPEED) + MIN_SPEED)
+#endif // CURVE_ACCELE_DECELE
 
-int32_t step_motor_get_pos(void) { 
-	M_DBG("motor info:\n");
-	M_DBG("\tdir:						%d\n", motor.dir);
-	M_DBG("\tsta: 					%d\n", motor.sta);
+/**
+ * @brief IMPORTANT! Mapping the abstracted speed to TIM PWM frequence
+ *
+ * 		timClk / (Prescaler+1) / (Period+1) / Motor_one_round_pulse * 60s = motor speed in round/min
+ * eg: 84MHz / (20+1) / (999+1) / 1600pulse/round * 60s = 150round/min
+ *
+ *		(Period+1)		Speed(round/min)
+ *		   250					  600
+ *		   500					  300
+ *		   750					  200
+ *		  1000					  150
+ *		  1250					  120
+ *		  ...							...
+ *		 20000						7.5
+ */
+#define MIN_TIM_PERIOD (500 - 1)   // max speed
+#define MAX_TIM_PERIOD (20000 - 1) // min speed
+#define MOTOR_SET_SPEED(spd) __HAL_TIM_SET_AUTORELOAD(&htim1, (MAX_TIM_PERIOD - (MAX_TIM_PERIOD - MIN_TIM_PERIOD) * (spd) / (MAX_SPEED - MIN_SPEED)))
+
+MOTOR_TYPE_t motor = {
+	.dir = MOTOR_DIR_IN,
+	.sta = MOTOR_STA_STOP,
+	.cur_pos = 0,
+	.tar_pos = 0,
+	.def_step_num = DEFAULT_STEP_NUM,
+	.accele_step = 0,
+	.uniform_step = 0,
+	.decele_step = 0,
+	.cur_step = 0,
+	.speed = MIN_SPEED};
+
+volatile uint8_t isMotorRunning = 0;
+static volatile uint32_t cnt_pulse;
+
+void motion_info(void)
+{
+	M_DBG("motion info:\n");
+	M_DBG("\tdir:						%s\n", (motor.dir) ? "IN" : "OUT");
 	M_DBG("\tcur_pos: 			%d\n", motor.cur_pos);
 	M_DBG("\ttar_pos: 			%d\n", motor.tar_pos);
+	M_DBG("\tmove_pos:			%d\n", motor.tar_pos - motor.cur_pos);
 	M_DBG("\taccele_step: 	%d\n", motor.accele_step);
 	M_DBG("\tuniform_step:	%d\n", motor.uniform_step);
-	M_DBG("\tdecele_step: 	%d\n", motor.decele_step);
-	M_DBG("\tcur_step:			%d\n\n", motor.cur_step);
+	M_DBG("\tdecele_step: 	%d\n\n", motor.decele_step);
+}
+
+void step_motor_set_cur_pos(int32_t pos)
+{
+	motor.cur_pos = pos;
+}
+
+int32_t step_motor_get_cur_pos(void)
+{
 	return motor.cur_pos;
 }
 
-uint8_t step_motor_set_pos(int32_t pos)
+uint8_t step_motor_set_tar_pos(int32_t pos)
 {
-	if(motor.sta != MOTOR_STA_STOP) {
+	M_DBG("\n\n/************** tarStep:%d ****************/\n", pos);
+
+	if (motor.sta != MOTOR_STA_STOP)
+	{
 		M_ERR("Motor is running, can NOT set the new target position\n");
 		return 1;
 	}
-	
-	if(pos == motor.cur_pos) {
+
+	if (pos == motor.cur_pos)
+	{
 		M_DBG("target position is current position\n");
 		return 0;
 	}
-	
-	// MOTOR_POWER_ON();
+
+	MOTOR_POWER_ON();
 	MOTOR_SET_ENABLE(1);
-	
-	if (pos > motor.cur_pos) {
+
+	if (pos > motor.cur_pos)
+	{
 		motor.dir = MOTOR_DIR_IN;
 		MOTOR_SET_DIR(MOTOR_DIR_IN);
-  } else {
+	}
+	else
+	{
 		motor.dir = MOTOR_DIR_OUT;
 		MOTOR_SET_DIR(MOTOR_DIR_OUT);
-  }
-	
-  if (abs(motor.cur_pos - pos) > motor.def_step_num * 2) {
+	}
+
+	if (abs(motor.cur_pos - pos) > motor.def_step_num * 2)
+	{
 		motor.accele_step = motor.def_step_num;
 		motor.uniform_step = abs(motor.cur_pos - pos) - motor.def_step_num * 2;
 		motor.decele_step = motor.def_step_num;
-  } else {
-		motor.accele_step = abs(motor.cur_pos - pos) / 2;
+	}
+	else
+	{
+		motor.decele_step = abs(motor.cur_pos - pos) / 2;
 		motor.uniform_step = 0;
-		motor.decele_step = abs(motor.cur_pos - pos) - motor.accele_step;
-  }
-	
-  if (motor.accele_step) {
-		motor.sta = MOTOR_STA_ACCELE;
-  } else {
-		motor.sta = MOTOR_STA_DECELE;
-  }
-	motor.cur_step = 0;
+		motor.accele_step = abs(motor.cur_pos - pos) - motor.decele_step;
+	}
+
+	motor.sta = MOTOR_STA_ACCELE;
+	motor.cur_step = 1;
 	motor.tar_pos = pos;
-	step_motor_get_pos();
-	
-	M_DBG("%s\n", (motor.sta == MOTOR_STA_ACCELE) ? "motor acceleration" : "motor deceleration");
-	
-	get_next_speed();
-	
+	motor.speed = MOTOR_CAL_SPEED(1); // (1 - COS(_PI * 1 / motor.def_step_num)) / 2 * 10000;
+	motor.cur_step = 1;
+	motion_info();
+
+	M_DBG("motor acceleration\n");
+	isMotorRunning = 1;
+	MOTOR_SET_SPEED(motor.speed);
+	TIM_PWM_START();
+
 	return 0;
 }
-
 /**
  * @brief Get the next speed
  *
- * @return uint16_t range: 0~10000; 0: stop; 10000: max speed
+ * @return uint16_t range: [MIN_SPEED, MAX_SPEED]; MIN_SPEED: stop; MAX_SPEED: max speed
  */
-uint16_t get_next_speed(void)
+uint16_t motor_next_step(void)
 {
-	static uint16_t speed = 0;
-	
-	if(motor.dir == MOTOR_DIR_IN) {
+	if (motor.dir == MOTOR_DIR_IN)
+	{
 		motor.cur_pos++;
-	} else {
+	}
+	else
+	{
 		motor.cur_pos--;
 	}
 
+	M_DBG("\tpos,%4d, step,%3d, spd,%5d, \n", motor.cur_pos, motor.cur_step, motor.speed);
+
 	motor.cur_step++;
-	if(motor.sta == MOTOR_STA_ACCELE) {
-		if(motor.cur_step > motor.accele_step) {
+	if (motor.sta == MOTOR_STA_ACCELE)
+	{
+		if (motor.cur_step > motor.accele_step)
+		{
 			motor.cur_step = 1;
-			if(abs(motor.cur_pos - motor.tar_pos) > motor.decele_step) {
+			if (motor.decele_step == 0)
+			{
+				motor.sta = MOTOR_STA_STOP;
+				TIM_PWM_STOP();
+				MOTOR_SET_ENABLE(0);
+				MOTOR_POWER_OFF();
+			}
+			else if (abs(motor.cur_pos - motor.tar_pos) > motor.decele_step)
+			{
 				motor.sta = MOTOR_STA_RUN;
-				speed = 10000;
+				motor.speed = MAX_SPEED;
+				MOTOR_SET_SPEED(motor.speed);
 				M_DBG("motor uniform motion\n");
-			} else {
+			}
+			else
+			{
 				motor.sta = MOTOR_STA_DECELE;
 				M_DBG("motor deceleration\n");
 			}
-		} else {
-			speed = (1 - COS(_PI * motor.cur_step / motor.accele_step)) / 2 * 10000;
+		}
+		else
+		{
+			motor.speed = MOTOR_CAL_SPEED(motor.cur_step); // (1 - COS(_PI * motor.cur_step / motor.def_step_num)) / 2 * 10000;
+			MOTOR_SET_SPEED(motor.speed);
+			if (motor.cur_step == 1)
+			{
+				TIM_PWM_START();
+			}
 		}
 	}
-	
-	if(motor.sta == MOTOR_STA_RUN) {
-		if(motor.cur_step > motor.uniform_step) {
+
+	if (motor.sta == MOTOR_STA_RUN)
+	{
+		if (motor.cur_step > motor.uniform_step)
+		{
 			motor.cur_step = 1;
 			motor.sta = MOTOR_STA_DECELE;
 			M_DBG("motor deceleration\n");
 		}
 	}
 
-	if(motor.sta == MOTOR_STA_DECELE) {
-		if(motor.cur_step > motor.decele_step) {
-			extern volatile uint16_t cnt_pulse;
+	if (motor.sta == MOTOR_STA_DECELE)
+	{
+		if (motor.cur_step > motor.decele_step)
+		{
 			motor.sta = MOTOR_STA_STOP;
-			motor.cur_step = 0;
-			speed = 0;
+			TIM_PWM_STOP();
 			MOTOR_SET_ENABLE(0);
-			// MOTOR_POWER_OFF();
-			M_DBG("total pulse: %d\n", cnt_pulse);
-		} else {
-			speed = (1 + COS(_PI * (motor.cur_step - 1) / motor.decele_step)) / 2 * 10000;
+			MOTOR_POWER_OFF();
+		}
+		else
+		{
+			motor.speed = MOTOR_CAL_SPEED((motor.decele_step - motor.cur_step + 1)); // (1 - COS(_PI * (motor.decele_step - motor.cur_step + 1) / motor.def_step_num)) / 2 * 10000;
+			MOTOR_SET_SPEED(motor.speed);
 		}
 	}
 
-	if(speed != 0) {
-		//MOTOR_SET_SPEED(speed);
-		MOTOR_SET_SPEED(65535);
-		TIM_PWM_START();
+	cnt_pulse++;
+	if (motor.sta == MOTOR_STA_STOP)
+	{
+		motor.accele_step = 0;
+		motor.uniform_step = 0;
+		motor.decele_step = 0;
+		motor.cur_step = 0;
+		motor.speed = MIN_SPEED;
+		MOTOR_SET_SPEED(motor.speed);
+
+		M_DBG("total pulse: %d\n", cnt_pulse);
+		cnt_pulse = 0;
+		isMotorRunning = 0;
 	}
-	M_DBG("pos,%4d, step,%3d, spd,%5d, \n", motor.cur_pos, motor.cur_step, speed);
-	return speed;
+
+	return motor.speed;
+}
+
+void MOTOR_E_Stop(void)
+{
+	TIM_PWM_STOP();
+	MOTOR_SET_ENABLE(0);
+	MOTOR_POWER_OFF();
+
+	M_DBG("Motor E-Stop\n");
+	cnt_pulse = 0;
+	isMotorRunning = 0;
+	motor.sta = MOTOR_STA_STOP;
+	motor.accele_step = 0;
+	motor.uniform_step = 0;
+	motor.decele_step = 0;
+	motor.cur_step = 0;
+	motor.speed = MIN_SPEED;
+	MOTOR_SET_SPEED(motor.speed);
 }

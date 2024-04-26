@@ -90,15 +90,19 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM1_Init();
-  /* USER CODE BEGIN 2 */	
-	LOG_DBG("cur pos: %d\n", step_motor_get_pos());
-	step_motor_set_pos(1000);
+  /* USER CODE BEGIN 2 */
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+		static uint16_t tarStep = 0;
+		if(isMotorRunning == 0) {
+			tarStep += step_motor_get_cur_pos();
+			step_motor_set_tar_pos(tarStep++);
+		}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

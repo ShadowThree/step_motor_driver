@@ -45,7 +45,7 @@ void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 240-1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 10000-1;
+  htim1.Init.Period = 1000-1;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 10000;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -189,13 +189,7 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 			cnt = 0;
 		}
 #endif
-		static uint16_t cnt = 0;
-		uint16_t val = get_next_speed();
-		LOG_DBG("tim callback val[%3d]=%5d, curStep[%3d] mSta[%d]\n", ++cnt, val, motor.cur_step, motor.sta);
-		__HAL_TIM_SET_AUTORELOAD(&htim1, 10000);
-		if(cnt >= 105) {
-			HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1);
-		}
+		motor_next_step();
 	}
 }
 /* USER CODE END 1 */
